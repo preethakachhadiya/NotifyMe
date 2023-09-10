@@ -1,0 +1,1566 @@
+# AWSTemplateFormatVersion: 2023-07-07
+Resources:
+  DynamodbUsers:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: cp_users
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+  DynamodbEvents:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: cp_events
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - DynamodbUsers
+  DynamodbReminders:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: cp_reminders
+      AttributeDefinitions:
+        - AttributeName: reminder_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reminder_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - DynamodbEvents
+  # -----------------------------------------------------------------------------------------
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cloud_project_send_email_notification
+    DependsOn:
+      - DynamodbReminders
+  # ----------------------------------------------------------------------------------------
+  RegisterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import uuid, json
+
+          def lambda_handler(event, context):
+              table_name = 'cp_users'
+              dynamodb = boto3.resource('dynamodb')
+
+              try:
+                  user_id = str(uuid.uuid4())
+                  record = event
+                  record['user_id'] = user_id
+                  record['token'] = ''
+
+                  table = dynamodb.Table(table_name)
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': record['email']}
+                  )
+                  items = response['Items']
+                  if not items:         
+                      table.put_item(
+                          Item=record
+                      )
+                      attributes = {
+                                      'email': [record['email']]
+                                  }
+                      sns_client = boto3.client('sns', region_name='us-east-1')
+                      response = sns_client.subscribe(
+                          TopicArn='arn:aws:sns:us-east-1:877341190502:cloud_project_send_email_notification',
+                          Protocol='email',
+                          Endpoint= record['email'],
+                          Attributes={
+                              'FilterPolicy': json.dumps(attributes)
+                          }
+                      )
+                      return {
+                          'statusCode': 200,
+                          'body': f'Record added successfully with user_id: {user_id}'
+                      }
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': f'Email already in use. Please use another email.'
+                      }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+      FunctionName: cp_register
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - SnsTopic
+  LoginLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, uuid
+          from boto3.dynamodb.conditions import Key
+
+          def lambda_handler(event, context):
+              table_name = 'cp_users'
+              email = event['email']
+              password = event['password']
+
+              dynamodb = boto3.resource('dynamodb')
+
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': email}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if user['password'] == password:
+                    token = str(uuid.uuid4())
+                    response = table.update_item(
+                        Key={
+                            'user_id': user['user_id']
+                        },
+                        UpdateExpression=f'SET login_token = :val',
+                        ExpressionAttributeValues={
+                            ':val': token
+                        },
+                        ReturnValues='ALL_NEW'  
+                    )
+                    user['token'] = token
+                    print('response after adding token', response.get('Attributes', {}))
+                    return {
+                        'statusCode': 200,
+                        'body': user,  
+                    }
+                  else:
+                      return {
+                          'statusCode': 401,
+                          'body': 'Invalid credentials. Login failed.'
+                      }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+      FunctionName: cp_login
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - RegisterLambda
+  CreateEventLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, uuid, boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='user_id = :id_val',
+                      ExpressionAttributeValues={':id_val': event['user_id']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # -------------------------------------------------------------------------------
+              
+              record = event
+              record['event_id'] = str(uuid.uuid4())
+              table = dynamodb.Table('cp_events')
+              table.put_item(
+                  Item=record
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': 'New event created successfully'
+              }
+      FunctionName: cp_createEvent
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - LoginLambda
+  GetEventsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='user_id = :id_val',
+                      ExpressionAttributeValues={':id_val': event['user_id']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # ----------------------------------------------------------------------------------------------
+
+              userid = event['user_id']  
+              try:
+                  table = dynamodb.Table('cp_events')
+                  response = table.scan(
+                      FilterExpression="user_id = :id",
+                      ExpressionAttributeValues={":id": userid}
+                  )
+                  items = response.get('Items', [])
+                  print(items)
+                  return {
+                      'statusCode': 200,
+                      'body': items
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+      FunctionName: cp_getEventsByUserId
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - CreateEventLambda
+  AddReminderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, uuid
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': event['email']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+          # -------------------------------------------------------------------------------
+              record = event
+              record['reminder_id'] = str(uuid.uuid4())
+              table = dynamodb.Table('cp_reminders')
+              table.put_item(
+                  Item=record
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': 'New reminder created successfully'
+              }
+      FunctionName: cp_add_reminder
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - GetEventsLambda
+  GetRemindersLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': event['email']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # ----------------------------------------------------------------------------------------------
+
+              event_id = event['event_id']  
+              try:
+                  table = dynamodb.Table('cp_reminders')
+                  response = table.scan(
+                      FilterExpression="event_id = :id",
+                      ExpressionAttributeValues={":id": event_id}
+                  )
+                  items = response.get('Items', [])
+                  print(items)
+                  return {
+                      'statusCode': 200,
+                      'body': items
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+      FunctionName: cp_get_reminders_by_eventId
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - AddReminderLambda
+  UpdateReminderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, uuid
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': event['email']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # -------------------------------------------------------------------------------
+              table = dynamodb.Table('cp_reminders')
+              reminder_id = event['reminder_id']
+              new_message = event['message']
+              new_date = event['date']
+              response = table.update_item(
+                  Key={
+                      'reminder_id': reminder_id
+                  },
+                  UpdateExpression='SET message = :new_msg, #dt = :new_date',
+                  ExpressionAttributeNames={
+                          '#dt': 'date'
+                      },
+                  ExpressionAttributeValues={
+                      ':new_msg': new_message,
+                      ':new_date': new_date
+                  },
+                  ReturnValues='UPDATED_NEW'  
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Reminder updated successfully'
+              }
+      FunctionName: cp_update_reminder
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - GetRemindersLambda
+  DeleteReminderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': event['email']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # -------------------------------------------------------------------------------
+              table = dynamodb.Table('cp_reminders')
+              
+              reminder_id = event['reminder_id']
+              response = table.delete_item(
+                  Key={
+                      'reminder_id': reminder_id
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Reminder deleted successfully'
+              }
+      FunctionName: cp_delete_reminder
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - UpdateReminderLambda
+  DeleteEventLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, uuid
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.scan(
+                      FilterExpression='email = :email_val',
+                      ExpressionAttributeValues={':email_val': event['email']}
+                  )
+                  items = response['Items']
+                  print('items:', items)
+                  if not items:
+                      return {
+                          'statusCode': 404,
+                          'body': 'User not found with the provided email.'
+                      }
+                  user = items[0]
+                  if not user['login_token']:
+                      return {
+                          'statusCode': 400,
+                          'body': 'User not logged in.'
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+                  
+          # -------------------------------------------------------------------------------
+
+              table1 = dynamodb.Table('cp_reminders')
+              event_id = event['event_id']
+              response = table1.scan(
+                  FilterExpression=f'event_id = :attr_value',
+                  ExpressionAttributeValues={':attr_value': event_id}
+              )
+              print('reminders list', response.get('Items', []))
+              for item in response.get('Items', []):
+                  table1.delete_item(
+                      Key={
+                          'reminder_id': item['reminder_id']
+                      }
+                  )
+
+          # -------------------------------------------------------------------------------
+              table2 = dynamodb.Table('cp_events')
+              response = table2.delete_item(
+                  Key={
+                      'event_id': event_id
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Reminder deleted successfully'
+              }
+      FunctionName: cp_delete_event
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - DeleteReminderLambda
+  SendEmailDailyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+
+          def is_today(iso_date_string):
+              datetime_obj = datetime.datetime.fromisoformat(iso_date_string)
+              today_date = datetime.datetime.now().date()
+              return datetime_obj.date() == today_date
+
+          def lambda_handler(event, context):
+              table_name = 'cp_reminders'
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(table_name)
+              response = table.scan()
+              items = response['Items']
+              filtered_items = [item for item in items if is_today(item['date'])]
+              table2 = dynamodb.Table('cp_events')
+              print('table2', table2.key_schema)
+              key_attribute = 'event_id'
+              
+              sns_client = boto3.client('sns', region_name='us-east-1')
+              
+              for reminder in filtered_items:
+                  print('reminder', reminder)
+                  event_id = reminder.get('event_id')
+                  print(event_id)
+                  try:
+                      response = table2.get_item(
+                          Key={'event_id': event_id}
+                      )
+                      item = response.get('Item')
+                      print('event name:', item)
+                      reminder['event_name'] = item.get('name')
+                      
+                  except Exception as e:
+                      return {
+                          'statusCode': 500,
+                          'body': f'Error occurred: {str(e)}'
+                      }
+                      
+                  event_name = reminder.get('event_name')
+                  date = reminder.get('date')
+                  message = reminder.get('message')
+                  email = reminder.get('email')
+                  
+                  message_attributes = {
+                      'email': {
+                          'DataType': 'String',
+                          'StringValue': email
+                      }
+                  }
+                  email_message = f'This is reminder notification set by you. \n\n Event: {event_name}, {date[0:10]} \n Message: {message}'
+                  response = sns_client.publish(
+                      TopicArn='arn:aws:sns:us-east-1:877341190502:cloud_project_send_email_notification',
+                      Message=email_message,
+                      Subject='Reminder for event: ' + event_name,
+                      MessageAttributes=message_attributes
+                  )
+                  response = table.delete_item(
+                      Key={
+                          'reminder_id': reminder.get('reminder_id')
+                      }
+                  )
+              print("Items for today's date:", filtered_items)
+      FunctionName: cp_send_email_daily
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - DeleteEventLambda
+  LogoutLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, uuid
+          from boto3.dynamodb.conditions import Key
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              user_id = event['user_id']
+
+              try:
+                  table = dynamodb.Table('cp_users')
+                  response = table.update_item(
+                      Key={
+                          'user_id': user_id
+                      },
+                      UpdateExpression=f'SET login_token = :val',
+                      ExpressionAttributeValues={
+                          ':val': ''
+                      },
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': 'Logout successful.',
+                      
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error occurred: {str(e)}'
+                  }
+      FunctionName: cp_logout
+      Role: arn:aws:iam::283944140949:role/LabRole
+      Handler: index.lambda_handler
+      Runtime: python3.11
+    DependsOn:
+      - SendEmailDailyLambda
+  # -----------------------------------------------------------------------------------
+  APIGatewayRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: ReminderApp
+    DependsOn:
+      - LogoutLambda
+  # ------------------------------------------------------------------------------------
+  RegisterAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: register
+    DependsOn:
+      - APIGatewayRestAPI
+  LoginAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: login
+    DependsOn:
+      - APIGatewayRestAPI
+  CreateEventAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: create-event
+    DependsOn:
+      - APIGatewayRestAPI
+  GetEventsAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: get-events
+    DependsOn:
+      - APIGatewayRestAPI
+  AddReminderAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: add-reminder
+    DependsOn:
+      - APIGatewayRestAPI
+  GetRemindersAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: get-reminders
+    DependsOn:
+      - APIGatewayRestAPI
+  UpdateReminderAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: update-reminder
+    DependsOn:
+      - APIGatewayRestAPI
+  DeleteReminderAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: delete-reminder
+    DependsOn:
+      - APIGatewayRestAPI
+  DeleteEventAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: delete-event
+    DependsOn:
+      - APIGatewayRestAPI
+  LogoutAPIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: logout
+    DependsOn:
+      - APIGatewayRestAPI
+  # -----------------------------------------------------------------
+  RegisterAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref RegisterAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt RegisterLambda.Arn
+    DependsOn:
+      - LogoutAPIGatewayResource
+  RegisterOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref RegisterAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  LoginAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref LoginAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt LoginLambda.Arn
+    DependsOn:
+      - RegisterAPIGatewayMethod
+  LoginOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref LoginAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  CreateEventAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref CreateEventAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt CreateEventLambda.Arn
+    DependsOn:
+      - LoginAPIGatewayMethod
+  CreateEventOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref CreateEventAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  GetEventsAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref GetEventsAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt GetEventsLambda.Arn
+    DependsOn:
+      - CreateEventAPIGatewayMethod
+  GetEventsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref GetEventsAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  AddReminderAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref AddReminderAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt AddReminderLambda.Arn
+    DependsOn:
+      - GetEventsAPIGatewayMethod
+  AddReminderOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref AddReminderAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  GetRemindersAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref GetRemindersAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt GetRemindersLambda.Arn
+    DependsOn:
+      - AddReminderAPIGatewayMethod
+  GetRemindersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref GetRemindersAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  UpdateReminderAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref UpdateReminderAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt UpdateReminderLambda.Arn
+    DependsOn:
+      - GetRemindersAPIGatewayMethod
+  UpdateReminderOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref UpdateReminderAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  DeleteReminderAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref DeleteReminderAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt DeleteReminderLambda.Arn
+    DependsOn:
+      - UpdateReminderAPIGatewayMethod
+  DeleteReminderOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref DeleteReminderAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  DeleteEventAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref DeleteEventAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt DeleteEventLambda.Arn
+    DependsOn:
+      - DeleteReminderAPIGatewayMethod
+  DeleteEventOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref DeleteEventAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  LogoutAPIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref LogoutAPIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: 'Empty'
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt LogoutLambda.Arn
+    DependsOn:
+      - DeleteEventAPIGatewayMethod
+  LogoutOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref LogoutAPIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              'method.response.header.Access-Control-Allow-Methods': "'GET,POST,PUT,DELETE'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+          ResponseModels:
+            'application/json': 'Empty'
+  # -----------------------------------------------------------------------------------------
+  APIGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName: dev
+    DependsOn:
+      - LogoutAPIGatewayMethod
+  # ----------------------------------------------------------------------------------------
+  RegisterAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt RegisterLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestAPI}/*/*'
+    DependsOn:
+      - APIGatewayDeployment
+  LoginAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LoginLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  CreateEventAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt CreateEventLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  GetEventsAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt GetEventsLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  AddReminderAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt AddReminderLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  GetRemindersAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt GetRemindersLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  UpdateReminderAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt UpdateReminderLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  DeleteReminderAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DeleteReminderLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  DeleteEventAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DeleteEventLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  LogoutAPIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LogoutLambda.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  # ------------------------------------------------------------------------------
+  MySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: CloudSecret
+      Description: My secret
+      # SecretString: !Join
+      #   - ""
+      #   - - "{\"UserPoolID\": \""
+      #     - !Ref UserPool
+      #     - "\"}"
+      SecretString: !Sub
+        - |
+          {
+            "Deployment": "${Deployment}"
+          }
+        - { Deployment: !Ref APIGatewayRestAPI }
+    DependsOn:
+      - APIGatewayRestAPI
+  # ------------------------------------------------------------------------------------
+  # for 4 pm everyday
+  EventBridgeScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Name: send_email_daily
+      ScheduleExpression: cron(30 23 * * ? *)
+      State: ENABLED
+      Target:
+        Arn: !GetAtt SendEmailDailyLambda.Arn
+        RoleArn: arn:aws:iam::283944140949:role/LabRole
+    DependsOn:
+      - DynamodbUsers
+      - DynamodbEvents
+      - DynamodbReminders
+      - SnsTopic
+  # -------------------------------------------------------------------------------------------
+  CloudProjectElasticBeanstalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      Description: Cloud project Elastic Beanstalk Application
+
+  CloudProjectElasticBeanstalkApplicationVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref CloudProjectElasticBeanstalkApplication
+      SourceBundle:
+        S3Bucket: cloud-project-frontend
+        S3Key: cloud_project_frontend.zip
+
+  CloudProjectElasticBeanstalkEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref CloudProjectElasticBeanstalkApplication
+      EnvironmentName: CloudProjectElasticBeanstalkEnvironment
+      SolutionStackName: 64bit Amazon Linux 2 v5.8.4 running Node.js 18
+      VersionLabel: !Ref CloudProjectElasticBeanstalkApplicationVersion
+      Tier:
+        Name: WebServer
+        Type: Standard
+        Version: '1.0'
+      OptionSettings:
+        - Namespace: 'aws:autoscaling:launchconfiguration'
+          OptionName: 'InstanceType'
+          Value: 't3.micro'
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: LabInstanceProfile
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: EC2KeyName
+          Value: vockey
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: LoadBalanced
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: LabRole
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: NODE_ENV
+          Value: production
